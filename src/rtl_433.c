@@ -30,6 +30,13 @@
 #include "data.h"
 #include "util.h"
 
+#ifdef SOAPYSDR
+    #include "convenience.h"
+    #include <SoapySDR/Device.h>
+    #include <SoapySDR/Formats.h>
+    // FIXME:
+    #define rtlsdr_cancel_async(dev) 0
+#endif
 
 static int do_exit = 0;
 static int do_exit_async = 0, frequencies = 0;
@@ -43,7 +50,13 @@ int stop_after_successful_events_flag = 0;
 uint32_t samp_rate = DEFAULT_SAMPLE_RATE;
 float sample_file_pos = -1;
 static uint32_t bytes_to_read = 0;
+#ifdef SOAPYSDR
+static SoapySDRDevice *dev = NULL;
+static SoapySDRStream *stream = NULL;
+char *dev_query = "";
+#else
 static rtlsdr_dev_t *dev = NULL;
+#endif
 static int override_short = 0;
 static int override_long = 0;
 int include_only = 0;  // Option -I
@@ -1103,6 +1116,15 @@ int main(int argc, char **argv) {
     }
 
     if (!in_filename) {
+#ifdef SOAPYSDR
+    r = verbose_device_search(dev_query, &dev, &stream, SOAPY_SDR_CS16);
+
+    if (r != 0)
+    {
+        fprintf(stderr, "Failed to open sdr device matching '%s'.\n", dev_query);
+        exit(1);
+    }
+#else
     device_count = rtlsdr_get_device_count();
     if (!device_count) {
         fprintf(stderr, "No supported devices found.\n");
@@ -1156,6 +1178,7 @@ int main(int argc, char **argv) {
         if(!quiet_mode) fprintf(stderr, "Unable to open a device\n");
         exit(1);
     }
+#endif
 
 #ifndef _WIN32
     sigact.sa_handler = sighandler;
@@ -1169,14 +1192,23 @@ int main(int argc, char **argv) {
     SetConsoleCtrlHandler((PHANDLER_ROUTINE) sighandler, TRUE);
 #endif
     /* Set the sample rate */
+#ifdef SOAPYSDR
+    verbose_set_sample_rate(dev, samp_rate);
+#else
     r = rtlsdr_set_sample_rate(dev, samp_rate);
     if (r < 0)
         fprintf(stderr, "WARNING: Failed to set sample rate.\n");
     else
         fprintf(stderr, "Sample rate set to %d.\n", rtlsdr_get_sample_rate(dev)); // Unfortunately, doesn't return real rate
+#endif
 
     fprintf(stderr, "Bit detection level set to %d%s.\n", demod->level_limit, (demod->level_limit ? "" : " (Auto)"));
 
+#ifdef SOAPYSDR
+    verbose_auto_gain(dev);
+
+    verbose_ppm_set(dev, ppm_error);
+#else
     if (0 == gain) {
         /* Enable automatic gain */
         r = rtlsdr_set_tuner_gain_mode(dev, 0);
@@ -1199,6 +1231,7 @@ int main(int argc, char **argv) {
     }
 
     r = rtlsdr_set_freq_correction(dev, ppm_error);
+#endif
 
     }
 
@@ -1285,9 +1318,13 @@ int main(int argc, char **argv) {
     }
 
     /* Reset endpoint before we start reading from it (mandatory) */
+#ifdef SOAPYSDR
+    verbose_reset_buffer(dev);
+#else
     r = rtlsdr_reset_buffer(dev);
     if (r < 0)
         fprintf(stderr, "WARNING: Failed to reset buffers.\n");
+#endif
 
     if (sync_mode) {
         if (!demod->out_file) {
@@ -1300,7 +1337,11 @@ int main(int argc, char **argv) {
 
       time_t timestamp;
         while (!do_exit) {
+#ifdef SOAPYSDR
+            r = -1; // FIXME:
+#else
             r = rtlsdr_read_sync(dev, buffer, out_block_size, &n_read);
+#endif
             if (r < 0) {
                 fprintf(stderr, "WARNING: sync read failed.\n");
                 break;
@@ -1344,7 +1385,14 @@ int main(int argc, char **argv) {
     if (!quiet_mode) {
         fprintf(stderr, "Reading samples in async mode...\n");
     }
+#ifdef SOAPYSDR
+    uint16_t *buffer = malloc(out_block_size * SoapySDR_formatToSize(SOAPY_SDR_CS16));
+    uint8_t *buf8 = malloc(out_block_size * SoapySDR_formatToSize(SOAPY_SDR_CU8));
+#endif
         while (!do_exit) {
+#ifdef SOAPYSDR
+            verbose_set_frequency(dev, frequency[frequency_current]);
+#else
             /* Set the frequency */
             center_frequency = frequency[frequency_current];
             r = rtlsdr_set_center_freq(dev, center_frequency);
@@ -1352,6 +1400,51 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "WARNING: Failed to set center freq.\n");
             else
                 fprintf(stderr, "Tuned to %u Hz.\n", rtlsdr_get_center_freq(dev));
+#endif
+#ifdef SOAPYSDR
+            if (SoapySDRDevice_activateStream(dev, stream, 0, 0, 0) != 0)
+            {
+                fprintf(stderr, "Failed to activate stream\n");
+                exit(1);
+            }
+
+            do {
+                void *buffs[] = {buffer};
+                int flags = 0;
+                long long timeNs = 0;
+                long timeoutNs = 1000000;
+                int n_read = 0, r, i;
+
+                r = SoapySDRDevice_readStream(dev, stream, buffs, out_block_size, &flags, &timeNs, timeoutNs);
+
+                //fprintf(stderr, "readStream ret=%d, flags=%d, timeNs=%lld\n", r, flags, timeNs);
+                if (r >= 0)
+                {
+                    // r is number of elements read, elements=complex pairs of 8-bits, so buffer length in bytes is twice
+                    n_read = r * 2;
+                }
+                else
+                {
+                    if (r == SOAPY_SDR_OVERFLOW)
+                    {
+                        fprintf(stderr, "O");
+                        fflush(stderr);
+                        continue;
+                    }
+                    fprintf(stderr, "WARNING: sync read failed. %d\n", r);
+                }
+
+                // FIXME: hack
+                for (i = 0; i < n_read; ++i)
+                {
+                    buf8[i] = ((int16_t)buffer[i] / 32767.0 * 128.0 + 127.4);
+                }
+                rtlsdr_callback(buf8, out_block_size, (void *)demod);
+
+            } while (!do_exit_async);
+
+#else
+
 #ifndef _WIN32
             signal(SIGALRM, sighandler);
             alarm(1); // require callback to run at least every second, abort otherwise
@@ -1364,6 +1457,8 @@ int main(int argc, char **argv) {
             }
 #ifndef _WIN32
             alarm(0); // cancel the watchdog timer
+#endif
+
 #endif
             do_exit_async = 0;
             frequency_current = (frequency_current + 1) % frequencies;
@@ -1378,6 +1473,11 @@ int main(int argc, char **argv) {
     if (demod->out_file && (demod->out_file != stdout))
         fclose(demod->out_file);
 
+#ifdef SOAPYSDR
+    SoapySDRDevice_deactivateStream(dev, stream, 0, 0);
+    SoapySDRDevice_closeStream(dev, stream);
+#endif
+
     for (i = 0; i < demod->r_dev_num; i++)
         free(demod->r_devs[i]);
 
@@ -1386,7 +1486,11 @@ int main(int argc, char **argv) {
 
     free(demod);
 
+#ifdef SOAPYSDR
+    SoapySDRDevice_unmake(dev);
+#else
     rtlsdr_close(dev);
+#endif
 out:
     for (output_handler_t *output = output_handler; output; output = output->next) {
         if (output->aux_free) {

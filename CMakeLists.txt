@@ -44,12 +44,26 @@ if (("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU" OR "${CMAKE_C_COMPILER_ID}" STREQUA
     #http://gcc.gnu.org/wiki/Visibility
     add_definitions(-fvisibility=hidden)
 endif()
+if ("${CMAKE_C_COMPILER_ID}" STREQUAL "Clang")
+    # make sure we don't accidentally copy more than an int
+    ADD_DEFINITIONS(-Wlarge-by-value-copy=8)
+endif()
 
 ########################################################################
 # Find build dependencies
 ########################################################################
 find_package(PkgConfig)
 find_package(LibRTLSDR)
+
+# TODO:make this optional
+find_package(SoapySDR "0.6" NO_MODULE)
+if (NOT SoapySDR_FOUND)
+    message(FATAL_ERROR "Soapy SDR development files not found...")
+endif ()
+include_directories(${SoapySDR_INCLUDE_DIRS})
+# TODO: join with LIBRTLSDR_LIBRARIES and use in src/CMakeLists.txt
+list(APPEND SDR_LIBRARIES ${SoapySDR_LIBRARIES})
+ADD_DEFINITIONS(-DSOAPYSDR)
 
 ########################################################################
 # Setup the include and linker paths
